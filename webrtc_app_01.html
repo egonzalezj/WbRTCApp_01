@@ -1,0 +1,294 @@
+<!DOCTYPE html>
+<!--
+* File name: webrtc_app_01.html
+* Description:
+* WebRTC App.
+* Basic video call.
+* Autor: Rob Manson.
+* Copyright (c) 2010-2013.
+* Editor: Elisabet González.
+* Date: June 2nd, 2016.
+* Version 1.0
+*
+* History:
+* v1.0  02/06/2016  getUserMedia function used.
+-->
+<html>
+<head>
+
+  <script>
+    //Placeholders
+    var webrtc_capable = true;
+    var rtc_peer_connection = null; //Pointer to RTCPeerConnection
+    var rtc_session_media = null; //Pointer to the browser-specific implementation of the RTCSessionDescription constructor
+    var get_user_media = null; //Pointer to the standard navigator
+    var connect_stream_to_src = null; //Function that accepts a reference to a MediaStream object
+    var stun_server = "stun.l.google.com:19302"; //Holds a pointer to Google's public STUN server
+
+    //Check if the standard navigator.gerUserMedia is supported
+    if (navigator.getUserMedia) { //WebRTC 1.0 standard compliant browser
+      rtc_peer_connection = RTCPeerConnection;
+      rtc_session_description = RTCSessionDescription;
+      get_user_media = navigator.getUserMedia.bind(navigator);
+      connect_stream_to_src = function(media_stream, media_element) {
+        // https://www.w3.org/Bugs/Public/show_bug.cgi?id=21606
+        media_element.srcObject = media_stream;
+        media_element.play();
+      };
+    } else if (navigator.mozGetUserMedia) { //Early firefox WebRTC implementation
+      rtc_peer_connection = mozRTCPeerConnection;
+      rtc_session_description = mozRTCSessionDescription;
+      get_user_media = navigator.mozGetUserMedia.bind(navigator);
+      connect_stream_to_src = function(media_stream, media_element) {
+        media_element.mozSrcObject = media_stream;
+        media_element.play();
+      };
+      stun_server = "74.125.31.127:19302";
+    } else if (navigator.webkitGetUserMedia) { //Early webkit WebRTC implementation
+      rtc_peer_connection = webkitRTCPeerConnection;
+      rtc_session_description = RTCSessionDescription;
+      get_user_media = navigator.webkitGetUserMedia.bind(navigator);
+      connect_stream_to_src = function(media_stream, media_element) {
+        media_element.src = webkitURL.createObjectURL(media_stream);
+      };
+    } else {
+      alert("This browser does not support WebRTC - visit WebRTC.org for more info");
+      webrtc_capable = false;
+    }
+  </script>
+  <script>
+    var call_token; //Unique ID that links two users together
+    var signaling_server; //Represents the WebSocketAPI connection to the signaling server
+    var peer_connection; //Represents the actual RTCPeerConnection that will be established between these two users
+
+    function start() { //Detects if is the caller or the callee, sets up the relevant functionality to match
+      //Create the WebRTC peer connection object
+      peer_connection = new rtc_peer_connection({ //RTCPeerConnection configuration
+        "iceServers": [ //Information about ICE servers
+          { "url": "stun:"+stun_server }, //Stun server info
+        ]
+      });
+
+      //Generic handler that sends any ice candidates to the other peer
+      peer_connection.onicecandidate = function (ice_event) {
+        if (ice_event.candidate) {
+          signaling_server.send(
+            JSON.stringify({
+              type: "new_ice_candidate",
+              candidate: ice_event.candidate ,
+            })
+          );
+        }
+      };
+
+      //Display remote video streams when they arrive using local <video> MediaElement
+      peer_connection.onaddstream = function (event) {
+        connect_stream_to_src(event.stream, document.getElementById("remote_video"));
+        //Hide placeholder and show remote video
+        document.getElementById("loading_state").style.display = "none";
+        document.getElementById("open_call_state").style.display = "block";
+      };
+
+      //Setup stream from the local camera
+      setup_video();
+
+      //Setup generic connection to the signaling server using the WebSocket API
+      signaling_server = new WebSocket("ws://10.6.2.8:1234");
+
+      if (document.location.hash === "" || document.location.hash === undefined) { //You are the Caller
+
+        //Create the unique token for this call
+        var token = Date.now()+"-"+Math.round(Math.random()*10000);
+        call_token = "#"+token;
+
+        //Set location.hash to the unique token for this call
+        document.location.hash = token;
+
+        signaling_server.onopen = function() {
+          //Setup caller signal handler
+          signaling_server.onmessage = caller_signal_handler;
+
+          //Tell the signaling server you have joined the call
+          signaling_server.send(
+            JSON.stringify({
+              token:call_token,
+              type:"join",
+            })
+          );
+        }
+
+        document.title = "You are the Caller";
+        document.getElementById("loading_state").innerHTML = "Ready for a call...ask your friend to visit:<br/><br/>"+document.location;
+
+      } else { //You have a hash fragment so you must be the Callee
+
+        //Get the unique token for this call from location.hash
+        call_token = document.location.hash;
+
+        signaling_server.onopen = function() {
+          //Setup caller signal handler
+          signaling_server.onmessage = callee_signal_handler;
+
+          //Tell the signaling server you have joined the call
+          signaling_server.send(
+            JSON.stringify({
+              token:call_token,
+              type:"join",
+            })
+          );
+
+          //Let the caller know you have arrived so they can start the call
+          signaling_server.send(
+            JSON.stringify({
+              token:call_token,
+              type:"callee_arrived",
+            })
+          );
+        }
+
+        document.title = "You are the Callee";
+        document.getElementById("loading_state").innerHTML = "One moment please...connecting your call...";
+      }
+
+    }
+
+    //Functions used above are defined below
+
+    //Handler to process new descriptions
+    function new_description_created(description) {
+      peer_connection.setLocalDescription(
+        description,
+        function () {
+          signaling_server.send(
+            JSON.stringify({
+              token:call_token,
+              type:"new_description",
+              sdp:description
+            })
+          );
+        },
+        log_error
+      );
+    }
+
+    //Handle signals as a caller
+    function caller_signal_handler(event) {
+      var signal = JSON.parse(event.data);
+      if (signal.type === "callee_arrived") {
+        peer_connection.createOffer(
+          new_description_created,
+          log_error
+        );
+      } else if (signal.type === "new_ice_candidate") {
+        peer_connection.addIceCandidate(
+          new RTCIceCandidate(signal.candidate)
+        );
+      } else if (signal.type === "new_description") {
+        peer_connection.setRemoteDescription(
+          new rtc_session_description(signal.sdp),
+          function () {
+            if (peer_connection.remoteDescription.type == "answer") {
+              //Extend with your own custom answer handling here
+            }
+          },
+          log_error
+        );
+      } else {
+        //Extend with your own signal types here
+      }
+    }
+
+    //Handle signals as a callee
+    function callee_signal_handler(event) {
+      var signal = JSON.parse(event.data);
+      if (signal.type === "new_ice_candidate") {
+        peer_connection.addIceCandidate(
+          new RTCIceCandidate(signal.candidate)
+        );
+      } else if (signal.type === "new_description") {
+        peer_connection.setRemoteDescription(
+          new rtc_session_description(signal.sdp),
+          function () {
+            if (peer_connection.remoteDescription.type == "offer") {
+              peer_connection.createAnswer(new_description_created, log_error);
+            }
+          },
+          log_error
+        );
+      } else {
+        //Extend with your own signal types here
+      }
+    }
+
+    //Setup stream from the local camera
+    function setup_video() {
+      get_user_media(
+        {
+          "audio": true, //Request access to local microphone
+          "video": true  //Request access to local camera
+        },
+        function (local_stream) { //Success callback
+          //Display preview from the local camera & microphone using local <video> MediaElement
+          connect_stream_to_src(local_stream, document.getElementById("local_video"));
+          //Add local camera stream to peer_connection ready to be sent to the remote peer
+          peer_connection.addStream(local_stream);
+        },
+        log_error
+      );
+    }
+
+    //Generic error handler
+    function log_error(error) {
+      console.log(error);
+    }
+  </script>
+
+  <!--CSS styles-->
+  <style>
+    html, body {
+      padding: 0px;
+      margin: 0px;
+      font-family: "Arial","Helvetica",sans-serif;
+    }
+    #loading_state {
+      position: absolute;
+      top: 45%;
+      left: 0px;
+      width: 100%;
+      font-size: 20px;
+      text-align: center;
+    }
+    #open_call_state {
+      display: none;
+    }
+    #local_video {
+      position: absolute;
+      top: 10px;
+      left: 10px;
+      width: 160px;
+      height: 120px;
+      background: #333333;
+    }
+    #remote_video {
+      position: absolute;
+      top: 0px;
+      left: 0px;
+      width: 1024px;
+      height: 768px;
+      background: #999999;
+    }
+  </style>
+
+    <title>WebRTC App</title>
+</head>
+
+<body onload="start()">
+  <div id="loading_state">
+    loading...
+  </div>
+  <div id="open_call_state">
+    <video id="remote_video"></video>
+    <video id="local_video"></video>
+  </div>
+</body>
+</html>
